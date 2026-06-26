@@ -30,6 +30,21 @@ type LowzoResult = {
   score: number;
 };
 
+type SavedItemRecord = {
+  id: string;
+  marketplace: string;
+  marketplace_item_id: string;
+  title: string;
+  price: string | null;
+  shipping: string | null;
+  total_price: string | null;
+  image_url: string | null;
+  item_url: string;
+  condition: string | null;
+  location: string | null;
+  created_at: string;
+};
+
 type SearchFilters = {
   category: string;
   condition: string;
@@ -49,7 +64,6 @@ const defaultFilters: SearchFilters = {
 };
 
 const RESULTS_PER_PAGE = 10;
-const SAVED_ITEMS_KEY = "lowzo_saved_items";
 const SAVED_SEARCHES_KEY = "lowzo_saved_searches";
 
 function formatPrice(price: number) {
@@ -94,7 +108,7 @@ export default function SearchPage() {
   const [maxPrice, setMaxPrice] = useState(defaultFilters.maxPrice);
 
   const [results, setResults] = useState<LowzoResult[]>([]);
-  const [savedItems, setSavedItems] = useState<LowzoResult[]>([]);
+  const [savedItemIds, setSavedItemIds] = useState<string[]>([]);
   const [hasSearched, setHasSearched] = useState(false);
   const [lastSearchType, setLastSearchType] = useState<"text" | "image" | null>(
     null
@@ -104,6 +118,7 @@ export default function SearchPage() {
   const [imageFileName, setImageFileName] = useState("");
 
   const [isLoading, setIsLoading] = useState(false);
+  const [isSavingItem, setIsSavingItem] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [statusMessage, setStatusMessage] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
@@ -157,10 +172,12 @@ export default function SearchPage() {
           });
         } else {
           setCurrentUser(null);
+          setSavedItemIds([]);
         }
       } catch {
         if (isMounted) {
           setCurrentUser(null);
+          setSavedItemIds([]);
         }
       } finally {
         if (isMounted) {
@@ -198,21 +215,53 @@ export default function SearchPage() {
   }, []);
 
   useEffect(() => {
-    try {
-      const savedItemsFromStorage = localStorage.getItem(SAVED_ITEMS_KEY);
+    if (!currentUser) {
+      return;
+    }
 
-      if (savedItemsFromStorage) {
-        const parsed = JSON.parse(savedItemsFromStorage);
+    let isMounted = true;
 
-        if (Array.isArray(parsed)) {
-          setSavedItems(parsed);
+    async function loadSavedItems() {
+      try {
+        const response = await fetch(`/api/saved-items?time=${Date.now()}`, {
+          method: "GET",
+          cache: "no-store",
+          credentials: "include",
+        });
+
+        const data = await response.json();
+
+        if (!isMounted) {
+          return;
+        }
+
+        if (!response.ok) {
+          setSavedItemIds([]);
+          return;
+        }
+
+        const savedItems = Array.isArray(data.savedItems)
+          ? (data.savedItems as SavedItemRecord[])
+          : [];
+
+        setSavedItemIds(
+          savedItems
+            .map((item) => String(item.marketplace_item_id || ""))
+            .filter(Boolean)
+        );
+      } catch {
+        if (isMounted) {
+          setSavedItemIds([]);
         }
       }
-    } catch {
-      localStorage.removeItem(SAVED_ITEMS_KEY);
-      setSavedItems([]);
     }
-  }, []);
+
+    void loadSavedItems();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [currentUser]);
 
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
@@ -295,7 +344,7 @@ export default function SearchPage() {
   }
 
   function isItemSaved(itemId: string) {
-    return savedItems.some((item) => item.id === itemId);
+    return savedItemIds.includes(itemId);
   }
 
   function showTemporaryStatus(message: string) {
@@ -306,32 +355,95 @@ export default function SearchPage() {
     }, 3000);
   }
 
-  function saveItemsToStorage(nextSavedItems: LowzoResult[]) {
-    setSavedItems(nextSavedItems);
-    localStorage.setItem(SAVED_ITEMS_KEY, JSON.stringify(nextSavedItems));
-  }
-
-  function toggleSavedItem(item: LowzoResult) {
+  async function toggleSavedItem(item: LowzoResult) {
     if (!requireLogin("/search")) {
       return;
     }
 
-    const alreadySaved = isItemSaved(item.id);
-
-    if (alreadySaved) {
-      const nextSavedItems = savedItems.filter(
-        (savedItem) => savedItem.id !== item.id
-      );
-
-      saveItemsToStorage(nextSavedItems);
-      showTemporaryStatus("Removed from saved items.");
+    if (isSavingItem) {
       return;
     }
 
-    const nextSavedItems = [item, ...savedItems];
+    const alreadySaved = isItemSaved(item.id);
+    setIsSavingItem(item.id);
+    setErrorMessage("");
 
-    saveItemsToStorage(nextSavedItems);
-    showTemporaryStatus("Saved item.");
+    if (alreadySaved) {
+      setSavedItemIds((current) =>
+        current.filter((savedItemId) => savedItemId !== item.id)
+      );
+
+      try {
+        const response = await fetch(
+          `/api/saved-items?marketplaceItemId=${encodeURIComponent(item.id)}`,
+          {
+            method: "DELETE",
+            cache: "no-store",
+            credentials: "include",
+          }
+        );
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || "Could not remove saved item.");
+        }
+
+        showTemporaryStatus("Removed from saved items.");
+      } catch (error) {
+        setSavedItemIds((current) =>
+          current.includes(item.id) ? current : [item.id, ...current]
+        );
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Could not remove saved item.";
+
+        setErrorMessage(message);
+      } finally {
+        setIsSavingItem("");
+      }
+
+      return;
+    }
+
+    setSavedItemIds((current) =>
+      current.includes(item.id) ? current : [item.id, ...current]
+    );
+
+    try {
+      const response = await fetch("/api/saved-items", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          item,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Could not save item.");
+      }
+
+      showTemporaryStatus("Saved to your account.");
+    } catch (error) {
+      setSavedItemIds((current) =>
+        current.filter((savedItemId) => savedItemId !== item.id)
+      );
+
+      const message =
+        error instanceof Error ? error.message : "Could not save item.";
+
+      setErrorMessage(message);
+    } finally {
+      setIsSavingItem("");
+    }
   }
 
   function saveCurrentSearch() {
@@ -502,7 +614,6 @@ export default function SearchPage() {
 
     setImagePreviewUrl("");
     setImageFileName("");
-
     showTemporaryStatus("Photo removed.");
   }
 
@@ -890,6 +1001,7 @@ export default function SearchPage() {
                   const realIndex =
                     (currentPage - 1) * RESULTS_PER_PAGE + index;
                   const saved = isItemSaved(item.id);
+                  const savingThisItem = isSavingItem === item.id;
 
                   return (
                     <article className="lowzo-result-card" key={item.id}>
@@ -909,6 +1021,7 @@ export default function SearchPage() {
                           type="button"
                           onClick={() => toggleSavedItem(item)}
                           aria-label={saved ? "Unsave item" : "Save item"}
+                          disabled={savingThisItem}
                         >
                           {saved ? "♥" : "♡"}
                         </button>
@@ -976,8 +1089,13 @@ export default function SearchPage() {
                           }
                           type="button"
                           onClick={() => toggleSavedItem(item)}
+                          disabled={savingThisItem}
                         >
-                          {saved ? "♥ Saved" : "♡ Save"}
+                          {savingThisItem
+                            ? "Saving..."
+                            : saved
+                            ? "♥ Saved"
+                            : "♡ Save"}
                         </button>
 
                         <p>Live eBay listing</p>
